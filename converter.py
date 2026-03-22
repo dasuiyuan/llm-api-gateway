@@ -1,11 +1,71 @@
 import json
 import uuid
-from typing import List, Dict, Any, Union
+from typing import List, Dict, Any, Union, Tuple
 from models import (
     AnthropicRequest, AnthropicResponse, AnthropicMessage,
     OpenAIRequest, OpenAIResponse, OpenAIMessage, OpenAITool,
     OpenAIToolCall, OpenAIToolCallFunction
 )
+
+
+class ThinkingParser:
+    """
+    将模型输出的 <think>...</think> 标签流式解析为
+    ("thinking", content) / ("text", content) 片段序列。
+    支持跨 chunk 的标签边界。
+    """
+
+    OPEN_TAG = "<think>"
+    CLOSE_TAG = "</think>"
+
+    def __init__(self):
+        self.buffer = ""
+        self.in_thinking = False
+
+    def feed(self, chunk: str) -> List[Tuple[str, str]]:
+        """消费一段新内容，返回已确定的 (type, content) 片段列表"""
+        self.buffer += chunk
+        results = []
+
+        while True:
+            if not self.in_thinking:
+                idx = self.buffer.find(self.OPEN_TAG)
+                if idx == -1:
+                    # 保留末尾可能是不完整标签的部分
+                    safe_len = max(0, len(self.buffer) - len(self.OPEN_TAG) + 1)
+                    if safe_len > 0:
+                        results.append(("text", self.buffer[:safe_len]))
+                        self.buffer = self.buffer[safe_len:]
+                    break
+                else:
+                    if idx > 0:
+                        results.append(("text", self.buffer[:idx]))
+                    self.buffer = self.buffer[idx + len(self.OPEN_TAG):]
+                    self.in_thinking = True
+            else:
+                idx = self.buffer.find(self.CLOSE_TAG)
+                if idx == -1:
+                    safe_len = max(0, len(self.buffer) - len(self.CLOSE_TAG) + 1)
+                    if safe_len > 0:
+                        results.append(("thinking", self.buffer[:safe_len]))
+                        self.buffer = self.buffer[safe_len:]
+                    break
+                else:
+                    if idx > 0:
+                        results.append(("thinking", self.buffer[:idx]))
+                    self.buffer = self.buffer[idx + len(self.CLOSE_TAG):]
+                    self.in_thinking = False
+
+        return results
+
+    def flush(self) -> List[Tuple[str, str]]:
+        """流结束时冲刷剩余 buffer"""
+        if not self.buffer:
+            return []
+        seg_type = "thinking" if self.in_thinking else "text"
+        result = [(seg_type, self.buffer)]
+        self.buffer = ""
+        return result
 
 
 class ProtocolConverter:
@@ -161,9 +221,17 @@ class ProtocolConverter:
         message = choice.message
         content = []
 
-        # 文本内容
+        # 文本内容（解析 <think>...</think> 标签）
         if message.content:
-            content.append({"type": "text", "text": message.content})
+            parser = ThinkingParser()
+            segments = parser.feed(message.content) + parser.flush()
+            for seg_type, seg_content in segments:
+                if not seg_content:
+                    continue
+                if seg_type == "thinking":
+                    content.append({"type": "thinking", "thinking": seg_content})
+                else:
+                    content.append({"type": "text", "text": seg_content})
 
         # 工具调用
         if message.tool_calls:

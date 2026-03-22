@@ -9,7 +9,7 @@ import logging
 from typing import Dict, Any, Union
 from config import settings
 from models import AnthropicRequest, AnthropicResponse
-from converter import ProtocolConverter
+from converter import ProtocolConverter, ThinkingParser
 
 # 配置日志
 logging.basicConfig(
@@ -157,12 +157,41 @@ async def stream_anthropic_response(openai_request, headers):
                 yield f"data: {json.dumps({'type': 'message_start', 'message': {'id': message_id, 'type': 'message', 'role': 'assistant', 'model': settings.openai_model, 'content': [], 'stop_reason': None, 'stop_sequence': None, 'usage': {'input_tokens': 0, 'output_tokens': 0}}})}\n\n"
 
                 # 追踪状态
-                text_block_index = None   # 文本块在 content 中的下标
+                thinking_block_index = None
+                thinking_block_open = False
+                text_block_index = None
+                text_block_open = False
                 next_block_index = 0
                 # tool_call_blocks: openai_index -> {block_index, id, name, args}
                 tool_call_blocks: Dict[int, Dict] = {}
                 full_text = ""
                 finish_reason = "stop"
+                parser = ThinkingParser()
+
+                async def emit_segment(seg_type: str, seg_content: str):
+                    """将解析好的 thinking/text 片段转为 Anthropic 流式事件"""
+                    nonlocal thinking_block_index, thinking_block_open
+                    nonlocal text_block_index, text_block_open, next_block_index, full_text
+                    if not seg_content:
+                        return
+                    if seg_type == "thinking":
+                        if not thinking_block_open:
+                            thinking_block_index = next_block_index
+                            next_block_index += 1
+                            thinking_block_open = True
+                            yield f"data: {json.dumps({'type': 'content_block_start', 'index': thinking_block_index, 'content_block': {'type': 'thinking', 'thinking': ''}})}\n\n"
+                        yield f"data: {json.dumps({'type': 'content_block_delta', 'index': thinking_block_index, 'delta': {'type': 'thinking_delta', 'thinking': seg_content}})}\n\n"
+                    else:
+                        if thinking_block_open:
+                            yield f"data: {json.dumps({'type': 'content_block_stop', 'index': thinking_block_index})}\n\n"
+                            thinking_block_open = False
+                        if not text_block_open:
+                            text_block_index = next_block_index
+                            next_block_index += 1
+                            text_block_open = True
+                            yield f"data: {json.dumps({'type': 'content_block_start', 'index': text_block_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+                        full_text += seg_content
+                        yield f"data: {json.dumps({'type': 'content_block_delta', 'index': text_block_index, 'delta': {'type': 'text_delta', 'text': seg_content}})}\n\n"
 
                 async for line in response.aiter_lines():
                     if not line.startswith("data: "):
@@ -184,22 +213,18 @@ async def stream_anthropic_response(openai_request, headers):
                     if choice.get("finish_reason"):
                         finish_reason = choice["finish_reason"]
 
-                    # —— 文本 delta ——
+                    # —— 文本 delta（经过 ThinkingParser 解析）——
                     text_chunk = delta.get("content")
                     if text_chunk:
-                        if text_block_index is None:
-                            text_block_index = next_block_index
-                            next_block_index += 1
-                            yield f"data: {json.dumps({'type': 'content_block_start', 'index': text_block_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
-                        full_text += text_chunk
-                        yield f"data: {json.dumps({'type': 'content_block_delta', 'index': text_block_index, 'delta': {'type': 'text_delta', 'text': text_chunk}})}\n\n"
+                        for seg_type, seg_content in parser.feed(text_chunk):
+                            async for event in emit_segment(seg_type, seg_content):
+                                yield event
 
                     # —— tool call delta ——
                     for tc in (delta.get("tool_calls") or []):
                         tc_idx = tc.get("index", 0)
 
                         if tc_idx not in tool_call_blocks:
-                            # 第一次出现，开启新的 tool_use 块
                             tc_id = tc.get("id", f"toolu_{uuid.uuid4().hex[:8]}")
                             tc_name = (tc.get("function") or {}).get("name", "")
                             block_index = next_block_index
@@ -218,8 +243,15 @@ async def stream_anthropic_response(openai_request, headers):
                             block_index = tool_call_blocks[tc_idx]["block_index"]
                             yield f"data: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'input_json_delta', 'partial_json': args_chunk}})}\n\n"
 
+                # 冲刷 parser 剩余内容
+                for seg_type, seg_content in parser.flush():
+                    async for event in emit_segment(seg_type, seg_content):
+                        yield event
+
                 # 关闭所有 content_block
-                if text_block_index is not None:
+                if thinking_block_open:
+                    yield f"data: {json.dumps({'type': 'content_block_stop', 'index': thinking_block_index})}\n\n"
+                if text_block_open:
                     yield f"data: {json.dumps({'type': 'content_block_stop', 'index': text_block_index})}\n\n"
                 for tc_data in tool_call_blocks.values():
                     yield f"data: {json.dumps({'type': 'content_block_stop', 'index': tc_data['block_index']})}\n\n"
