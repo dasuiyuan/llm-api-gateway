@@ -75,7 +75,7 @@ async def anthropic_switch(request: AnthropicRequest):
         )
 
     # 非流式响应处理
-    async with httpx.AsyncClient(timeout=60.0) as client:
+    async with httpx.AsyncClient(timeout=300.0) as client:
         try:
             response = await client.post(
                 f"{settings.openai_base_url}/chat/completions",
@@ -133,13 +133,12 @@ async def anthropic_switch(request: AnthropicRequest):
 
 
 async def stream_anthropic_response(openai_request, headers):
-    """处理流式响应"""
+    """处理流式响应，支持 text 和 tool_use"""
     logger.info("【流式响应】开始流式响应...")
     logger.info(f"  请求URL: {settings.openai_base_url}/chat/completions")
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
+    async with httpx.AsyncClient(timeout=300.0) as client:
         try:
-            # 发送流式请求
             async with client.stream(
                 "POST",
                 f"{settings.openai_base_url}/chat/completions",
@@ -152,93 +151,97 @@ async def stream_anthropic_response(openai_request, headers):
                     yield f"data: {json.dumps({'error': f'调用服务失败: {error_text.decode()}', 'status': response.status_code})}\n\n"
                     return
 
-                # 生成Anthropic格式的流式响应ID
                 message_id = f"msg_{uuid.uuid4().hex}"
 
-                # 发送开始事件
-                start_event = {
-                    "type": "message_start",
-                    "message": {
-                        "id": message_id,
-                        "type": "message",
-                        "role": "assistant",
-                        "model": settings.openai_model,
-                        "content": [],
-                        "stop_reason": None,
-                        "stop_sequence": None,
-                        "usage": {"input_tokens": 0, "output_tokens": 0}
-                    }
-                }
-                yield f"data: {json.dumps(start_event)}\n\n"
+                # message_start
+                yield f"data: {json.dumps({'type': 'message_start', 'message': {'id': message_id, 'type': 'message', 'role': 'assistant', 'model': settings.openai_model, 'content': [], 'stop_reason': None, 'stop_sequence': None, 'usage': {'input_tokens': 0, 'output_tokens': 0}}})}\n\n"
 
-                # 发送内容块事件
-                content_block_event = {
-                    "type": "content_block_start",
-                    "index": 0,
-                    "content_block": {"type": "text", "text": ""}
-                }
-                yield f"data: {json.dumps(content_block_event)}\n\n"
+                # 追踪状态
+                text_block_index = None   # 文本块在 content 中的下标
+                next_block_index = 0
+                # tool_call_blocks: openai_index -> {block_index, id, name, args}
+                tool_call_blocks: Dict[int, Dict] = {}
+                full_text = ""
+                finish_reason = "stop"
 
-                # 处理流式响应
-                logger.info("【流式响应】开始接收数据...")
-                full_content = ""
-                chunk_count = 0
                 async for line in response.aiter_lines():
-                    if line.startswith("data: "):
-                        try:
-                            data = json.loads(line[6:])
-                            if "choices" in data and len(data["choices"]) > 0:
-                                delta = data["choices"][0].get("delta", {})
-                                content = delta.get("content")
-                                if content:
-                                    full_content += content
-                                    chunk_count += 1
-                                    if chunk_count % 10 == 0:
-                                        logger.info(f"  [Chunk {chunk_count}] 累计内容长度: {len(full_content)}")
+                    if not line.startswith("data: "):
+                        continue
+                    raw = line[6:]
+                    if raw.strip() == "[DONE]":
+                        break
+                    try:
+                        data = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
 
-                                    # 发送内容增量事件
-                                    delta_event = {
-                                        "type": "content_block_delta",
-                                        "index": 0,
-                                        "delta": {"type": "text_delta", "text": content}
-                                    }
-                                    yield f"data: {json.dumps(delta_event)}\n\n"
-                        except json.JSONDecodeError:
-                            continue
+                    if not data.get("choices"):
+                        continue
 
-                # 发送内容块结束事件
-                end_event = {
-                    "type": "content_block_stop",
-                    "index": 0
-                }
-                yield f"data: {json.dumps(end_event)}\n\n"
+                    choice = data["choices"][0]
+                    delta = choice.get("delta", {})
 
-                # 发送消息结束事件
-                message_stop_event = {
-                    "type": "message_delta",
-                    "delta": {
-                        "stop_reason": "end_turn",
-                        "stop_sequence": None
-                    },
-                    "usage": {"output_tokens": len(full_content)}
-                }
-                yield f"data: {json.dumps(message_stop_event)}\n\n"
+                    if choice.get("finish_reason"):
+                        finish_reason = choice["finish_reason"]
 
-                # 发送最终结束事件
-                final_event = {"type": "message_stop"}
-                yield f"data: {json.dumps(final_event)}\n\n"
+                    # —— 文本 delta ——
+                    text_chunk = delta.get("content")
+                    if text_chunk:
+                        if text_block_index is None:
+                            text_block_index = next_block_index
+                            next_block_index += 1
+                            yield f"data: {json.dumps({'type': 'content_block_start', 'index': text_block_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+                        full_text += text_chunk
+                        yield f"data: {json.dumps({'type': 'content_block_delta', 'index': text_block_index, 'delta': {'type': 'text_delta', 'text': text_chunk}})}\n\n"
 
-                # 记录流式响应完成日志
+                    # —— tool call delta ——
+                    for tc in (delta.get("tool_calls") or []):
+                        tc_idx = tc.get("index", 0)
+
+                        if tc_idx not in tool_call_blocks:
+                            # 第一次出现，开启新的 tool_use 块
+                            tc_id = tc.get("id", f"toolu_{uuid.uuid4().hex[:8]}")
+                            tc_name = (tc.get("function") or {}).get("name", "")
+                            block_index = next_block_index
+                            next_block_index += 1
+                            tool_call_blocks[tc_idx] = {
+                                "block_index": block_index,
+                                "id": tc_id,
+                                "name": tc_name,
+                                "args": ""
+                            }
+                            yield f"data: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': {'type': 'tool_use', 'id': tc_id, 'name': tc_name, 'input': {}}})}\n\n"
+
+                        args_chunk = (tc.get("function") or {}).get("arguments", "")
+                        if args_chunk:
+                            tool_call_blocks[tc_idx]["args"] += args_chunk
+                            block_index = tool_call_blocks[tc_idx]["block_index"]
+                            yield f"data: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'input_json_delta', 'partial_json': args_chunk}})}\n\n"
+
+                # 关闭所有 content_block
+                if text_block_index is not None:
+                    yield f"data: {json.dumps({'type': 'content_block_stop', 'index': text_block_index})}\n\n"
+                for tc_data in tool_call_blocks.values():
+                    yield f"data: {json.dumps({'type': 'content_block_stop', 'index': tc_data['block_index']})}\n\n"
+
+                # stop_reason
+                if finish_reason == "tool_calls":
+                    stop_reason = "tool_use"
+                elif finish_reason == "length":
+                    stop_reason = "max_tokens"
+                else:
+                    stop_reason = "end_turn"
+
+                yield f"data: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': stop_reason, 'stop_sequence': None}, 'usage': {'output_tokens': len(full_text)}})}\n\n"
+                yield f"data: {json.dumps({'type': 'message_stop'})}\n\n"
+
                 logger.info("【流式响应】完成")
-                content_preview = full_content[:300] if len(full_content) > 300 else full_content
-                logger.info(f"  总内容长度: {len(full_content)} 字符")
-                logger.info(f"  内容预览: {content_preview}...")
+                logger.info(f"  文本长度: {len(full_text)} 字符, tool calls: {len(tool_call_blocks)}")
                 logger.info("=" * 60)
 
         except Exception as e:
             logger.error(f"【流式响应错误】{str(e)}")
-            error_event = {"type": "error", "error": {"type": "api_error", "message": str(e)}}
-            yield f"data: {json.dumps(error_event)}\n\n"
+            yield f"data: {json.dumps({'type': 'error', 'error': {'type': 'api_error', 'message': str(e)}})}\n\n"
 
 
 @app.get("/health")
